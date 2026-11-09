@@ -251,7 +251,7 @@ class MainApp extends StatelessWidget {
            ),
            
           bottomNavigationBar:BottomNavigationBar(
-          backgroundColor: const Color.fromRGBO(100, 12, 1, 1),
+          backgroundColor: const Color.fromARGB(255, 59, 1, 100),
 
           selectedItemColor: Colors.white,
           unselectedItemColor: Colors.white,
