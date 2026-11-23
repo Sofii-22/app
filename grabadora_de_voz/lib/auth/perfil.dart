@@ -1,5 +1,6 @@
+import 'dart:async';
 
-import 'dart:io';
+import 'package:flutter/foundation.dart';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -29,6 +30,9 @@ class _PerfilScreenState extends State<PerfilScreen> {
 
   String _nombre = '';
   String _apellidos = '';
+  String? _fotoUrl;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _perfilSubscription;
+  bool _guardandoPerfil = false;
 
   bool _notificaciones = true;
   bool _ocupado = false;
@@ -41,50 +45,56 @@ class _PerfilScreenState extends State<PerfilScreen> {
     _cargarPerfil();
   }
 
-  Future<void> _cargarPerfil() async {
+  @override
+  void dispose() {
+    _perfilSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _cargarPerfil() {
     final usuario = _usuario;
     if (usuario == null) return;
 
-    final partes =
-        (usuario.displayName ?? '').trim().split(' ');
+    final nombreAuth = (usuario.displayName ?? '').trim();
+    final partes = nombreAuth.isEmpty ? <String>[] : nombreAuth.split(RegExp(r'\s+'));
+    final nombre = partes.isEmpty ? '' : partes.first;
+    final apellidos = partes.length > 1 ? partes.skip(1).join(' ') : '';
 
-    final nombre = partes.isNotEmpty ? partes.first : '';
+    setState(() {
+      _nombre = nombre;
+      _apellidos = apellidos;
+      _fotoUrl = usuario.photoURL;
+    });
 
-    final apellidos = partes.length > 1
-        ? partes.skip(1).join(' ')
-        : '';
-
-    if (mounted) {
-      setState(() {
-        _nombre = nombre;
-        _apellidos = apellidos;
-      });
-    }
-
-    try {
-      final documento = await FirebaseFirestore.instance
-          .collection('usuarios')
-          .doc(usuario.uid)
-          .get();
-
-      if (!mounted) return;
-
+    // Firestore es la fuente principal de los datos editables.
+    // Escuchar cambios evita que la pantalla muestre un nombre antiguo.
+    _perfilSubscription?.cancel();
+    _perfilSubscription = FirebaseFirestore.instance
+        .collection('usuarios')
+        .doc(usuario.uid)
+        .snapshots()
+        .listen((documento) {
+      if (!mounted || _guardandoPerfil) return;
       final datos = documento.data();
-
-      if (datos != null) {
-        setState(() {
-          _nombre = datos['nombre'] as String? ?? nombre;
-
-          _apellidos =
-              datos['apellidos'] as String? ?? apellidos;
-
-          _notificaciones =
-              datos['notificaciones'] as bool? ?? true;
-        });
-      }
-    } catch (e) {
-      debugPrint('No se cargaron preferencias: $e');
-    }
+      if (datos == null) return;
+      setState(() {
+        _nombre = datos['nombre'] is String
+            ? datos['nombre'] as String
+            : nombre;
+        _apellidos = datos['apellidos'] is String
+            ? datos['apellidos'] as String
+            : apellidos;
+        _fotoUrl = datos['fotoUrl'] is String
+            ? datos['fotoUrl'] as String
+            : usuario.photoURL;
+        _notificaciones = datos['notificaciones'] is bool
+            ? datos['notificaciones'] as bool
+            : true;
+      });
+    }, onError: (Object error) {
+      debugPrint('Error al escuchar perfil en Firestore: $error');
+      _mensaje('No se pudo leer el perfil desde Firebase. Revisa los permisos.');
+    });
   }
 
   void _mensaje(String texto) {
@@ -107,64 +117,19 @@ class _PerfilScreenState extends State<PerfilScreen> {
     required String valorActual,
     required bool editarNombre,
   }) async {
-    final controller = TextEditingController(
-      text: valorActual,
-    );
+    if (_ocupado) return;
 
+    // El controlador pertenece al propio diálogo y se libera cuando Flutter
+    // termina de retirar la ruta, no justo después de Navigator.pop().
     final resultado = await showDialog<String>(
       context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: AppColors.gs50,
-          title: Text(
-            titulo,
-            style: AppTypography.h6.copyWith(
-              color: AppColors.gs900,
-            ),
-          ),
-          content: TextField(
-            controller: controller,
-            maxLength: 60,
-            textCapitalization:
-                TextCapitalization.words,
-            decoration: InputDecoration(
-              hintText: titulo,
-              filled: true,
-              fillColor: AppColors.gs300,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(
-                  AppRadius.radiusm,
-                ),
-                borderSide: BorderSide.none,
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(dialogContext);
-              },
-              child: const Text('Cancelar'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: AppColors.primary500,
-              ),
-              onPressed: () {
-                Navigator.pop(
-                  dialogContext,
-                  controller.text.trim(),
-                );
-              },
-              child: const Text('Guardar'),
-            ),
-          ],
-        );
-      },
+      builder: (_) => _DialogoEditarDato(
+        titulo: titulo,
+        valorActual: valorActual,
+      ),
     );
 
-    controller.dispose();
-
+    if (!mounted) return;
     if (resultado == null || resultado.isEmpty) {
       return;
     }
@@ -178,15 +143,14 @@ class _PerfilScreenState extends State<PerfilScreen> {
     final nuevosApellidos =
         editarNombre ? _apellidos : resultado;
 
+    if (_ocupado) return;
     setState(() {
       _ocupado = true;
+      _guardandoPerfil = true;
     });
 
     try {
-      await usuario.updateDisplayName(
-        '$nuevoNombre $nuevosApellidos'.trim(),
-      );
-
+      // Guardar primero en Firestore: es el origen de datos del perfil.
       await FirebaseFirestore.instance
           .collection('usuarios')
           .doc(usuario.uid)
@@ -196,16 +160,28 @@ class _PerfilScreenState extends State<PerfilScreen> {
       }, SetOptions(merge: true));
 
       if (!mounted) return;
-
       setState(() {
         _nombre = nuevoNombre;
         _apellidos = nuevosApellidos;
       });
 
-      _mensaje('Información actualizada');
+      // Mantener el nombre de Firebase Auth sincronizado, pero no perder
+      // el guardado correcto en Firestore si esta actualización falla.
+      try {
+        await usuario.updateDisplayName(
+          '$nuevoNombre $nuevosApellidos'.trim(),
+        );
+      } catch (error) {
+        debugPrint('Nombre guardado en Firestore; Auth no sincronizado: $error');
+      }
+
+      _mensaje('Información guardada correctamente');
+    } on FirebaseException catch (e) {
+      _mensaje('No se pudo guardar en Firebase (${e.code}). Revisa las reglas de Firestore.');
     } catch (e) {
       _mensaje('No se pudo guardar: $e');
     } finally {
+      _guardandoPerfil = false;
       if (mounted) {
         setState(() {
           _ocupado = false;
@@ -224,7 +200,7 @@ class _PerfilScreenState extends State<PerfilScreen> {
         imageQuality: 80,
       );
 
-      if (imagen == null) return;
+      if (imagen == null || !mounted) return;
 
       final usuario = _usuario;
       if (usuario == null) return;
@@ -236,21 +212,33 @@ class _PerfilScreenState extends State<PerfilScreen> {
       final referencia = FirebaseStorage.instance
           .ref('perfiles/${usuario.uid}/foto.jpg');
 
-      await referencia.putFile(
-        File(imagen.path),
-        SettableMetadata(
-          contentType: 'image/jpeg',
-        ),
+      // readAsBytes funciona tanto en Android como en Chrome.
+      final bytes = await imagen.readAsBytes();
+      if (bytes.isEmpty) {
+        throw StateError('La imagen seleccionada está vacía.');
+      }
+      await referencia.putData(
+        bytes,
+        SettableMetadata(contentType: 'image/jpeg'),
       );
 
       final url = await referencia.getDownloadURL();
 
-      await usuario.updatePhotoURL(url);
-      await usuario.reload();
+      // Persistir URL propia para no depender solo del proveedor Google.
+      await FirebaseFirestore.instance
+          .collection('usuarios')
+          .doc(usuario.uid)
+          .set({'fotoUrl': url}, SetOptions(merge: true));
+      try {
+        await usuario.updatePhotoURL(url);
+      } catch (error) {
+        debugPrint('Foto guardada en Firestore; Auth no sincronizado: $error');
+      }
 
       if (!mounted) return;
-
-      setState(() {});
+      setState(() {
+        _fotoUrl = url;
+      });
 
       _mensaje('Foto de perfil actualizada');
     } catch (e) {
@@ -485,7 +473,9 @@ class _PerfilScreenState extends State<PerfilScreen> {
 
     try {
       try {
-        await GoogleSignIn.instance.signOut();
+        if (!kIsWeb) {
+          await GoogleSignIn.instance.signOut();
+        }
       } catch (e) {
         debugPrint('Google Sign-Out: $e');
       }
@@ -506,8 +496,9 @@ class _PerfilScreenState extends State<PerfilScreen> {
 
   Widget _opcionPerfil(
     String titulo,
-    VoidCallback onTap,
-  ) {
+    VoidCallback onTap, {
+    String? valor,
+  }) {
     return Container(
       margin: const EdgeInsets.only(
         bottom: AppGap.gaprelated,
@@ -529,6 +520,9 @@ class _PerfilScreenState extends State<PerfilScreen> {
             color: AppColors.gs900,
           ),
         ),
+        subtitle: valor != null && valor.isNotEmpty
+            ? Text(valor, style: AppTypography.cptn.copyWith(color: AppColors.gs600))
+            : null,
         trailing: const Icon(
           Icons.chevron_right,
           color: AppColors.gs700,
@@ -548,7 +542,7 @@ class _PerfilScreenState extends State<PerfilScreen> {
         ? nombreCompleto
         : (usuario?.displayName ?? 'Mi usuario');
 
-    final urlFoto = usuario?.photoURL;
+    final urlFoto = _fotoUrl ?? usuario?.photoURL;
 
     return SafeArea(
       child: ListView(
@@ -670,6 +664,7 @@ class _PerfilScreenState extends State<PerfilScreen> {
               valorActual: _nombre,
               editarNombre: true,
             ),
+            valor: _nombre.isEmpty ? 'Sin completar' : _nombre,
           ),
 
           _opcionPerfil(
@@ -679,11 +674,13 @@ class _PerfilScreenState extends State<PerfilScreen> {
               valorActual: _apellidos,
               editarNombre: false,
             ),
+            valor: _apellidos.isEmpty ? 'Sin completar' : _apellidos,
           ),
 
           _opcionPerfil(
             'Email',
             _mostrarEmail,
+            valor: usuario?.email ?? 'Sin correo',
           ),
 
           const SizedBox(
@@ -754,3 +751,94 @@ class _PerfilScreenState extends State<PerfilScreen> {
     );
   }
 }
+// Diálogo independiente: evita destruir el TextEditingController mientras
+// Flutter todavía está cerrando la animación del AlertDialog.
+class _DialogoEditarDato extends StatefulWidget {
+  const _DialogoEditarDato({
+    required this.titulo,
+    required this.valorActual,
+  });
+
+  final String titulo;
+  final String valorActual;
+
+  @override
+  State<_DialogoEditarDato> createState() => _DialogoEditarDatoState();
+}
+
+class _DialogoEditarDatoState extends State<_DialogoEditarDato> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.valorActual);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _guardar() {
+    final valor = _controller.text.trim();
+    if (valor.isEmpty) return;
+    Navigator.of(context).pop(valor);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: AppColors.gs50,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppRadius.radiusl),
+      ),
+      title: Text(
+        widget.titulo,
+        style: AppTypography.h6.copyWith(color: AppColors.gs900),
+      ),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        maxLength: 60,
+        textCapitalization: TextCapitalization.words,
+        textInputAction: TextInputAction.done,
+        onSubmitted: (_) => _guardar(),
+        cursorColor: AppColors.primary500,
+        style: AppTypography.b2.copyWith(color: AppColors.gs900),
+        decoration: InputDecoration(
+          hintText: widget.titulo,
+          filled: true,
+          fillColor: AppColors.gs300,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(AppRadius.radiusm),
+            borderSide: BorderSide.none,
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(AppRadius.radiusm),
+            borderSide: const BorderSide(
+              color: AppColors.primary500,
+              width: 1.5,
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text('Cancelar',
+              style: AppTypography.butt.copyWith(color: AppColors.gs900)),
+        ),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: AppColors.primary500,
+          ),
+          onPressed: _guardar,
+          child: const Text('Guardar'),
+        ),
+      ],
+    );
+  }
+}
+
